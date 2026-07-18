@@ -10,7 +10,7 @@ Examples:
   # Basic: run one GB200 DSV4 Dynamo-vLLM point against an existing service.
   # By default this calls http://HOST:PORT/v1/chat/completions.
   python3 utils/manual_benchmark_existing_service.py \
-    --config-files .github/configs/nvidia-master.yaml \
+    --config-files configs/nvidia-master.yaml \
     --config-key dsv4-fp4-gb200-dynamo-vllm \
     --base-url http://HOST:PORT \
     --seq-lens 8k1k \
@@ -18,7 +18,7 @@ Examples:
 
   # Same run with bearer auth. Equivalent to exporting OPENAI_API_KEY first.
   python3 utils/manual_benchmark_existing_service.py \
-    --config-files .github/configs/nvidia-master.yaml \
+    --config-files configs/nvidia-master.yaml \
     --config-key dsv4-fp4-gb200-dynamo-vllm \
     --base-url http://HOST:PORT \
     --api-key "$OPENAI_API_KEY" \
@@ -29,7 +29,7 @@ Examples:
   # carry spec_decoding=mtp from the config key; the service itself must already
   # have been started with the matching MTP serving flags.
   python3 utils/manual_benchmark_existing_service.py \
-    --config-files .github/configs/nvidia-master.yaml \
+    --config-files configs/nvidia-master.yaml \
     --config-key dsv4-fp4-b200-vllm-mtp \
     --base-url http://HOST:PORT \
     --seq-lens 1k1k \
@@ -37,7 +37,7 @@ Examples:
 
   # Use the legacy completions endpoint instead of chat completions.
   python3 utils/manual_benchmark_existing_service.py \
-    --config-files .github/configs/nvidia-master.yaml \
+    --config-files configs/nvidia-master.yaml \
     --config-key dsv4-fp4-gb200-dynamo-vllm \
     --base-url http://HOST:PORT \
     --backend openai \
@@ -47,7 +47,7 @@ Examples:
 
   # Use a local tokenizer/model path while sending a service-visible model name.
   python3 utils/manual_benchmark_existing_service.py \
-    --config-files .github/configs/nvidia-master.yaml \
+    --config-files configs/nvidia-master.yaml \
     --config-key dsv4-fp4-gb200-dynamo-vllm \
     --base-url http://HOST:PORT \
     --seq-lens 8k1k \
@@ -57,7 +57,7 @@ Examples:
 
   # Run multiple concurrencies and keep raw/aggregated JSON under a custom dir.
   python3 utils/manual_benchmark_existing_service.py \
-    --config-files .github/configs/nvidia-master.yaml \
+    --config-files configs/nvidia-master.yaml \
     --config-key dsv4-fp4-gb200-dynamo-vllm \
     --base-url http://HOST:PORT \
     --seq-lens 8k1k \
@@ -66,7 +66,7 @@ Examples:
 
   # Skip health checks during local iteration and only print commands.
   python3 utils/manual_benchmark_existing_service.py \
-    --config-files .github/configs/nvidia-master.yaml \
+    --config-files configs/nvidia-master.yaml \
     --config-key dsv4-fp4-gb200-dynamo-vllm \
     --base-url http://HOST:PORT \
     --seq-lens 8k1k \
@@ -77,7 +77,7 @@ Examples:
   # Override GPU denominators used by process_result.py aggregation. Use this
   # when the actual P/D deployment differs from nvidia-master.yaml labels.
   python3 utils/manual_benchmark_existing_service.py \
-    --config-files .github/configs/nvidia-master.yaml \
+    --config-files configs/nvidia-master.yaml \
     --config-key dsv4-fp4-gb200-dynamo-vllm \
     --base-url http://HOST:PORT \
     --seq-lens 8k1k \
@@ -254,6 +254,27 @@ def config_bool(value: Any, default: bool = False) -> bool:
     return str(value).lower() == "true"
 
 
+def config_int(config: dict[str, Any], key: str, default: int = 1) -> int:
+    value = int(config.get(key, default))
+    if value <= 0:
+        raise ValueError(f"Config field {key!r} must be a positive integer, got {value}.")
+    return value
+
+
+def worker_gpu_count(worker: dict[str, Any]) -> int:
+    num_workers = int(worker["num-worker"])
+    if num_workers < 0:
+        raise ValueError(
+            f"Config field 'num-worker' must be a non-negative integer, got {num_workers}."
+        )
+    return (
+        num_workers
+        * config_int(worker, "tp")
+        * config_int(worker, "pp")
+        * config_int(worker, "pcp-size")
+    )
+
+
 def infer_chat_template_mode(
     config: dict[str, Any],
     explicit: str,
@@ -284,11 +305,17 @@ def result_stem(config: dict[str, Any], conc: int) -> str:
         p = config["prefill"]
         d = config["decode"]
         parts.extend([
-            f"p{p['num-worker']}tp{p['tp']}ep{p['ep']}",
-            f"d{d['num-worker']}tp{d['tp']}ep{d['ep']}",
+            f"p{p['num-worker']}tp{p['tp']}pp{config_int(p, 'pp')}"
+            f"dcp{config_int(p, 'dcp-size')}pcp{config_int(p, 'pcp-size')}ep{p['ep']}",
+            f"d{d['num-worker']}tp{d['tp']}pp{config_int(d, 'pp')}"
+            f"dcp{config_int(d, 'dcp-size')}pcp{config_int(d, 'pcp-size')}ep{d['ep']}",
         ])
     else:
-        parts.append(f"tp{config['tp']}ep{config.get('ep', 1)}")
+        parts.append(
+            f"tp{config['tp']}pp{config_int(config, 'pp')}"
+            f"dcp{config_int(config, 'dcp-size')}pcp{config_int(config, 'pcp-size')}"
+            f"ep{config.get('ep', 1)}"
+        )
     return "_".join(parts).replace("/", "_")
 
 
@@ -381,6 +408,8 @@ def process_one(
 ) -> Path | None:
     stem = raw_result.stem
     env = os.environ.copy()
+    env.pop("ROUTER_METADATA", None)
+    env.pop("KV_P2P_TRANSFER", None)
     env.update({
         "RUNNER_TYPE": str(config["runner"]),
         "FRAMEWORK": str(config["framework"]),
@@ -394,19 +423,39 @@ def process_one(
         "IMAGE": str(config["image"]),
     })
 
+    router = config.get("router")
+    if router is not None:
+        env["ROUTER_METADATA"] = json.dumps(router)
+
+    kv_p2p_transfer = config.get("kv-p2p-transfer")
+    if kv_p2p_transfer:
+        env["KV_P2P_TRANSFER"] = str(kv_p2p_transfer)
+
     if "prefill" in config:
         p = config["prefill"]
         d = config["decode"]
+        prefill_gpus = args.prefill_gpus
+        if prefill_gpus is None:
+            prefill_gpus = worker_gpu_count(p)
+        decode_gpus = args.decode_gpus
+        if decode_gpus is None:
+            decode_gpus = worker_gpu_count(d)
         env.update({
             "IS_MULTINODE": "true",
-            "PREFILL_GPUS": str(args.prefill_gpus or int(p["num-worker"]) * int(p["tp"])),
-            "DECODE_GPUS": str(args.decode_gpus or int(d["num-worker"]) * int(d["tp"])),
+            "PREFILL_GPUS": str(prefill_gpus),
+            "DECODE_GPUS": str(decode_gpus),
             "PREFILL_NUM_WORKERS": str(p["num-worker"]),
             "PREFILL_TP": str(p["tp"]),
+            "PREFILL_PP_SIZE": str(config_int(p, "pp")),
+            "PREFILL_DCP_SIZE": str(config_int(p, "dcp-size")),
+            "PREFILL_PCP_SIZE": str(config_int(p, "pcp-size")),
             "PREFILL_EP": str(p["ep"]),
             "PREFILL_DP_ATTN": str(config_bool(p.get("dp-attn"))).lower(),
             "DECODE_NUM_WORKERS": str(d["num-worker"]),
             "DECODE_TP": str(d["tp"]),
+            "DECODE_PP_SIZE": str(config_int(d, "pp")),
+            "DECODE_DCP_SIZE": str(config_int(d, "dcp-size")),
+            "DECODE_PCP_SIZE": str(config_int(d, "pcp-size")),
             "DECODE_EP": str(d["ep"]),
             "DECODE_DP_ATTN": str(config_bool(d.get("dp-attn"))).lower(),
         })
@@ -416,6 +465,9 @@ def process_one(
         env.update({
             "IS_MULTINODE": "false",
             "TP": str(config["tp"]),
+            "PP_SIZE": str(config_int(config, "pp")),
+            "DCP_SIZE": str(config_int(config, "dcp-size")),
+            "PCP_SIZE": str(config_int(config, "pcp-size")),
             "EP_SIZE": str(config.get("ep", 1)),
             "DP_ATTENTION": str(config_bool(config.get("dp-attn"))).lower(),
         })
@@ -438,14 +490,18 @@ def load_json(path: Path) -> dict[str, Any]:
 def _total_gpu_denominator(row: dict[str, Any]) -> float:
     if row.get("is_multinode"):
         return float(row.get("num_prefill_gpu", 0)) + float(row.get("num_decode_gpu", 0))
-    return float(row.get("tp", 0))
+    return (
+        float(row.get("tp", 0))
+        * float(row.get("pp", 1))
+        * float(row.get("pcp_size", 1))
+    )
 
 
 def _output_gpu_denominator(row: dict[str, Any]) -> float:
     if row.get("is_multinode"):
         decode_gpus = float(row.get("num_decode_gpu", 0))
         return decode_gpus if decode_gpus > 0 else _total_gpu_denominator(row)
-    return float(row.get("tp", 0))
+    return _total_gpu_denominator(row)
 
 
 def infer_total_token_throughput(row: dict[str, Any]) -> float:
@@ -539,7 +595,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-override", help="Tokenizer/model id or local path for prompt generation")
     parser.add_argument("--served-model-name", help="Model name sent in OpenAI API payload")
     parser.add_argument("--tokenizer", help="Tokenizer id/path if different from --model")
-    parser.add_argument("--tokenizer-mode", default="auto", choices=["auto", "slow", "mistral", "custom"])
+    parser.add_argument(
+        "--tokenizer-mode",
+        default="auto",
+        choices=["auto", "slow", "mistral", "custom", "deepseek_v4"],
+    )
     parser.add_argument("--backend", default="openai-chat")
     parser.add_argument("--endpoint", default="/v1/chat/completions")
     parser.add_argument("--request-rate", default="inf")
