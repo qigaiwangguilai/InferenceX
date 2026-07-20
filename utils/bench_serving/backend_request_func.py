@@ -10,6 +10,7 @@ from typing import List, Optional, Union
 
 import aiohttp
 import huggingface_hub.constants
+from dumpjsonl import parse_usage_tokens, prepare_dumpjsonl_payload
 from tqdm.asyncio import tqdm
 from transformers import (AutoTokenizer, PreTrainedTokenizer,
                           PreTrainedTokenizerFast)
@@ -30,6 +31,8 @@ class RequestFuncInput:
     extra_body: Optional[dict] = None
     multi_modal_content: Optional[dict] = None
     ignore_eos: bool = False
+    payload: Optional[dict] = None
+    require_usage: bool = False
 
 
 @dataclass
@@ -341,30 +344,38 @@ async def async_request_openai_chat_completions(
 
     async with aiohttp.ClientSession(trust_env=True,
                                      timeout=AIOHTTP_TIMEOUT) as session:
-        content = request_func_input.prompt
-        if request_func_input.multi_modal_content:
-            content = [{"type": "text", "text": request_func_input.prompt}]
-            content.append(request_func_input.multi_modal_content)
-        payload = {
-            "model": request_func_input.model_name \
+        if request_func_input.payload is not None:
+            payload = prepare_dumpjsonl_payload(
+                request_func_input.payload,
+                request_func_input.model_name
                 if request_func_input.model_name else request_func_input.model,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": content
+                request_func_input.output_len,
+            )
+        else:
+            content = request_func_input.prompt
+            if request_func_input.multi_modal_content:
+                content = [{"type": "text", "text": request_func_input.prompt}]
+                content.append(request_func_input.multi_modal_content)
+            payload = {
+                "model": request_func_input.model_name \
+                    if request_func_input.model_name else request_func_input.model,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": content
+                    },
+                ],
+                "temperature": 0.0,
+                "max_completion_tokens": request_func_input.output_len,
+                "stream": True,
+                "stream_options": {
+                    "include_usage": True,
                 },
-            ],
-            "temperature": 0.0,
-            "max_completion_tokens": request_func_input.output_len,
-            "stream": True,
-            "stream_options": {
-                "include_usage": True,
-            },
-        }
-        if request_func_input.ignore_eos:
-            payload["ignore_eos"] = request_func_input.ignore_eos
-        if request_func_input.extra_body:
-            payload.update(request_func_input.extra_body)
+            }
+            if request_func_input.ignore_eos:
+                payload["ignore_eos"] = request_func_input.ignore_eos
+            if request_func_input.extra_body:
+                payload.update(request_func_input.extra_body)
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}",
@@ -375,6 +386,8 @@ async def async_request_openai_chat_completions(
 
         generated_text = ""
         ttft = 0.0
+        usage_prompt_tokens = None
+        usage_completion_tokens = None
         st = time.perf_counter()
         most_recent_timestamp = st
         try:
@@ -405,15 +418,31 @@ async def async_request_openai_chat_completions(
                                                       most_recent_timestamp)
 
                                 generated_text += content or ""
-                            elif usage := data.get("usage"):
-                                output.output_tokens = usage.get(
+                            if usage := data.get("usage"):
+                                usage_prompt_tokens = usage.get("prompt_tokens")
+                                usage_completion_tokens = usage.get(
                                     "completion_tokens")
 
                             most_recent_timestamp = timestamp
 
                     output.generated_text = generated_text
-                    output.success = True
                     output.latency = most_recent_timestamp - st
+                    if request_func_input.require_usage:
+                        try:
+                            output.prompt_len, output.output_tokens = (
+                                parse_usage_tokens({
+                                    "prompt_tokens": usage_prompt_tokens,
+                                    "completion_tokens": usage_completion_tokens,
+                                })
+                            )
+                        except ValueError as exc:
+                            output.error = str(exc)
+                            output.success = False
+                        else:
+                            output.success = True
+                    else:
+                        output.output_tokens = usage_completion_tokens
+                        output.success = True
                 else:
                     output.error = response.reason or ""
                     output.success = False

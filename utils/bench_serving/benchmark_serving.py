@@ -14,10 +14,14 @@ On the client side, run:
     python benchmarks/benchmark_serving.py \
         --backend <backend> \
         --model <your_model> \
-        --dataset-name sharegpt \
-        --dataset-path <path to dataset> \
+        --dataset-name random \
         --request-rate <request_rate> \ # By default <request_rate> is inf
         --num-prompts <num_prompts> # By default <num_prompts> is 1000
+
+    To replay captured OpenAI Chat payloads, use:
+        --backend openai-chat \
+        --dataset-name dumpjsonl \
+        --dataset-path <path to JSONL dataset>
 
     when using tgi backend, add
         --endpoint /generate_stream
@@ -62,6 +66,7 @@ except ImportError:
     from argparse import ArgumentParser as FlexibleArgumentParser
 
 from benchmark_utils import convert_to_pytorch_benchmark_format
+from dumpjsonl import load_dumpjsonl_payloads
 from encoding_dsv4 import encode_messages as dsv4_encode_messages
 
 MILLISECONDS_TO_SECONDS_CONVERSION = 1000
@@ -95,6 +100,16 @@ class BenchmarkMetrics:
     median_e2el_ms: float
     std_e2el_ms: float
     percentiles_e2el_ms: List[Tuple[float, float]]
+
+
+@dataclass
+class BenchmarkRequest:
+    prompt: str
+    prompt_len: int
+    output_len: int
+    multi_modal_content: Optional[dict] = None
+    payload: Optional[dict] = None
+    require_usage: bool = False
 
 
 # --- Multiprocessing helpers for sample_random_requests ---
@@ -231,7 +246,7 @@ def sample_random_requests(
     tokenizer_mode: str = "auto",
     trust_remote_code: bool = False,
     num_workers: int = 0,
-) -> List[Tuple[str, int, int]]:
+) -> List[BenchmarkRequest]:
     vocab_size = tokenizer.vocab_size
     prefix_token_ids = np.random.randint(0, vocab_size, size=prefix_len).tolist()
 
@@ -303,7 +318,14 @@ def sample_random_requests(
         mismatches = []
         for chunk in chunk_results:
             for prompt, prompt_len, out_len, mm_content, mismatch in chunk:
-                input_requests.append((prompt, prompt_len, out_len, mm_content))
+                input_requests.append(
+                    BenchmarkRequest(
+                        prompt=prompt,
+                        prompt_len=prompt_len,
+                        output_len=out_len,
+                        multi_modal_content=mm_content,
+                    )
+                )
                 mismatches.append(mismatch)
         elapsed = time.perf_counter() - t0
         print(f"Prompt generation completed in {elapsed:.1f}s")
@@ -336,33 +358,56 @@ def sample_random_requests(
 
             prompt_len = len(tokenizer.encode(prompt, add_special_tokens=False))
             mismatches.append(prompt_len - tgt_prompt_len)
-            input_requests.append((prompt, prompt_len, output_lens[i], None))
+            input_requests.append(
+                BenchmarkRequest(
+                    prompt=prompt,
+                    prompt_len=prompt_len,
+                    output_len=output_lens[i],
+                )
+            )
 
     header_str = f'{"-"*19}  Input/Output Length Statistics  {"-"*19}'
     print(header_str)
     print(
         f' input_lens : '
-        f'min={min(r[1] for r in input_requests):<4d}  '
-        f'max={max(r[1] for r in input_requests):<4d}  '
-        f'mean={np.mean([r[1] for r in input_requests]):<7.2f}  '
+        f'min={min(r.prompt_len for r in input_requests):<4d}  '
+        f'max={max(r.prompt_len for r in input_requests):<4d}  '
+        f'mean={np.mean([r.prompt_len for r in input_requests]):<7.2f}  '
         f'avg_token_mismatch={np.mean(mismatches):<5.2f} '
     )
     print(
         f' output_lens: '
-        f'min={min(r[2] for r in input_requests):<4d}  '
-        f'max={max(r[2] for r in input_requests):<4d}  '
-        f'mean={np.mean([r[2] for r in input_requests]):<7.2f} '
+        f'min={min(r.output_len for r in input_requests):<4d}  '
+        f'max={max(r.output_len for r in input_requests):<4d}  '
+        f'mean={np.mean([r.output_len for r in input_requests]):<7.2f} '
     )
     print('-' * len(header_str), '\n')
 
     return input_requests
 
 
+def load_dumpjsonl_requests(
+    dataset_path: str,
+    output_len: int,
+) -> List[BenchmarkRequest]:
+    """Load OpenAI Chat Completions payloads from a JSONL dump."""
+    return [
+        BenchmarkRequest(
+            prompt="",
+            prompt_len=0,
+            output_len=output_len,
+            payload=payload,
+            require_usage=True,
+        )
+        for payload in load_dumpjsonl_payloads(dataset_path)
+    ]
+
+
 async def get_request(
-    input_requests: List[Tuple[str, int, int]],
+    input_requests: List[BenchmarkRequest],
     request_rate: float,
     burstiness: float = 1.0,
-) -> AsyncGenerator[Tuple[str, int, int], None]:
+) -> AsyncGenerator[BenchmarkRequest, None]:
     """
     Asynchronously generates requests at a specified rate
     with OPTIONAL burstiness.
@@ -403,10 +448,10 @@ async def get_request(
 
 
 def calculate_metrics(
-    input_requests: List[Tuple[str, int, int]],
+    input_requests: List[BenchmarkRequest],
     outputs: List[RequestFuncOutput],
     dur_s: float,
-    tokenizer: PreTrainedTokenizerBase,
+    tokenizer: Optional[PreTrainedTokenizerBase],
     selected_percentile_metrics: List[str],
     selected_percentiles: List[float],
     goodput_config_dict: Dict[str, float],
@@ -430,11 +475,15 @@ def calculate_metrics(
                 # len(outputs[i].itl) since multiple output tokens may be
                 # bundled together
                 # Note : this may inflate the output token count slightly
+                if tokenizer is None:
+                    raise ValueError(
+                        "Tokenizer fallback is unavailable for this dataset."
+                    )
                 output_len = len(
                     tokenizer(outputs[i].generated_text,
                               add_special_tokens=False).input_ids)
             actual_output_lens.append(output_len)
-            total_input += input_requests[i][1]
+            total_input += outputs[i].prompt_len
             tpot = 0
             if output_len > 1:
                 latency_minus_ttft = outputs[i].latency - outputs[i].ttft
@@ -516,8 +565,8 @@ async def benchmark(
     base_url: str,
     model_id: str,
     model_name: str,
-    tokenizer: PreTrainedTokenizerBase,
-    input_requests: List[Tuple[str, int, int]],
+    tokenizer: Optional[PreTrainedTokenizerBase],
+    input_requests: List[BenchmarkRequest],
     logprobs: Optional[int],
     best_of: int,
     request_rate: float,
@@ -538,8 +587,11 @@ async def benchmark(
         raise ValueError(f"Unknown backend: {backend}")
 
     print("Starting initial single prompt test run...")
-    test_prompt, test_prompt_len, test_output_len, test_mm_content = (
-        input_requests[0])
+    test_request = input_requests[0]
+    test_prompt = test_request.prompt
+    test_prompt_len = test_request.prompt_len
+    test_output_len = test_request.output_len
+    test_mm_content = test_request.multi_modal_content
     if backend != "openai-chat" and test_mm_content is not None:
         # multi-modal benchmark is only available on OpenAI Chat backend.
         raise ValueError(
@@ -555,6 +607,8 @@ async def benchmark(
         best_of=best_of,
         multi_modal_content=test_mm_content,
         ignore_eos=ignore_eos,
+        payload=test_request.payload,
+        require_usage=test_request.require_usage,
     )
 
     if num_warmups > 0:
@@ -628,7 +682,6 @@ async def benchmark(
     benchmark_start_time_unix = time.time()
     tasks: List[asyncio.Task] = []
     async for request in get_request(input_requests, request_rate, burstiness):
-        prompt, prompt_len, output_len, mm_content = request
         req_model_id, req_model_name = model_id, model_name
         if lora_modules:
             req_lora_module = next(lora_modules)
@@ -636,14 +689,16 @@ async def benchmark(
 
         request_func_input = RequestFuncInput(model=req_model_id,
                                               model_name=req_model_name,
-                                              prompt=prompt,
+                                              prompt=request.prompt,
                                               api_url=api_url,
-                                              prompt_len=prompt_len,
-                                              output_len=output_len,
+                                              prompt_len=request.prompt_len,
+                                              output_len=request.output_len,
                                               logprobs=logprobs,
                                               best_of=best_of,
-                                              multi_modal_content=mm_content,
-                                              ignore_eos=ignore_eos)
+                                              multi_modal_content=request.multi_modal_content,
+                                              ignore_eos=ignore_eos,
+                                              payload=request.payload,
+                                              require_usage=request.require_usage)
         tasks.append(
             asyncio.create_task(
                 limited_request_func(request_func_input=request_func_input,
@@ -840,14 +895,12 @@ def main(args: argparse.Namespace):
         api_url = f"http://{args.host}:{args.port}{args.endpoint}"
         base_url = f"http://{args.host}:{args.port}"
 
-    tokenizer = _load_tokenizer(
-        tokenizer_id,
-        tokenizer_mode=tokenizer_mode,
-        trust_remote_code=args.trust_remote_code,
-    )
-
-
     if args.dataset_name == "random":
+        tokenizer = _load_tokenizer(
+            tokenizer_id,
+            tokenizer_mode=tokenizer_mode,
+            trust_remote_code=args.trust_remote_code,
+        )
         input_requests = sample_random_requests(
             prefix_len=args.random_prefix_len,
             input_len=args.random_input_len,
@@ -862,7 +915,24 @@ def main(args: argparse.Namespace):
             trust_remote_code=args.trust_remote_code,
             num_workers=args.random_num_workers,
         )
-
+    elif args.dataset_name == "dumpjsonl":
+        if backend != "openai-chat":
+            raise ValueError(
+                "The dumpjsonl dataset requires the openai-chat backend."
+            )
+        if not args.endpoint.endswith("chat/completions"):
+            raise ValueError(
+                "The dumpjsonl dataset requires a chat/completions endpoint."
+            )
+        if not args.dataset_path:
+            raise ValueError(
+                "--dataset-path is required when --dataset-name=dumpjsonl."
+            )
+        tokenizer = None
+        input_requests = load_dumpjsonl_requests(
+            args.dataset_path,
+            args.random_output_len,
+        )
     else:
         raise ValueError(f"Unknown dataset: {args.dataset_name}")
 
@@ -909,7 +979,7 @@ def main(args: argparse.Namespace):
         result_json["model_id"] = model_id
         result_json["tokenizer_id"] = tokenizer_id
         result_json["best_of"] = args.best_of
-        result_json["num_prompts"] = args.num_prompts
+        result_json["num_prompts"] = len(input_requests)
 
         # Metadata
         if args.metadata:
@@ -995,15 +1065,14 @@ if __name__ == "__main__":
     parser.add_argument(
         "--dataset-name",
         type=str,
-        default="sharegpt",
-        choices=["random"],
+        default="random",
+        choices=["random", "dumpjsonl"],
         help="Name of the dataset to benchmark on.",
     )
     parser.add_argument("--dataset-path",
                         type=str,
                         default=None,
-                        help="Path to the sharegpt/sonnet dataset. "
-                        "Or the huggingface dataset ID if using HF dataset.")
+                        help="Path to the dumpjsonl dataset.")
     parser.add_argument(
         "--max-concurrency",
         type=int,

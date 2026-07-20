@@ -84,6 +84,18 @@ Examples:
     --conc 256 \
     --prefill-gpus 8 \
     --decode-gpus 8
+
+  # Replay captured OpenAI Chat payloads from JSONL. Each valid record is sent
+  # once per concurrency point; model and max_tokens are overridden from the
+  # served model name and the selected config's OSL.
+  python3 utils/manual_benchmark_existing_service.py \
+    --config-files configs/nvidia-master.yaml \
+    --config-key dsv4-fp4-gb200-dynamo-vllm \
+    --base-url http://HOST:PORT \
+    --seq-lens 8k1k \
+    --conc 256 \
+    --dataset-name dumpjsonl \
+    --dataset-path ./requests.jsonl
 """
 
 from __future__ import annotations
@@ -330,9 +342,14 @@ def benchmark_one(
     result_dir = Path(args.result_dir).resolve()
     result_dir.mkdir(parents=True, exist_ok=True)
 
-    num_prompts = args.num_prompts
-    if num_prompts is None:
-        num_prompts = max(args.min_num_prompts, conc * args.num_prompts_multiplier)
+    num_prompts = None
+    if args.dataset_name == "random":
+        num_prompts = args.num_prompts
+        if num_prompts is None:
+            num_prompts = max(
+                args.min_num_prompts,
+                conc * args.num_prompts_multiplier,
+            )
 
     use_chat_template, use_dsv4 = infer_chat_template_mode(
         config,
@@ -352,20 +369,13 @@ def benchmark_one(
         "--base-url",
         args.base_url.rstrip("/"),
         "--dataset-name",
-        "random",
-        "--random-input-len",
-        str(config["isl"]),
+        args.dataset_name,
         "--random-output-len",
         str(config["osl"]),
-        "--random-range-ratio",
-        str(args.random_range_ratio),
-        "--num-prompts",
-        str(num_prompts),
         "--max-concurrency",
         str(conc),
         "--request-rate",
         str(args.request_rate),
-        "--ignore-eos",
         "--save-result",
         "--num-warmups",
         str(args.num_warmups if args.num_warmups is not None else 2 * conc),
@@ -376,6 +386,18 @@ def benchmark_one(
         "--result-filename",
         f"{stem}.json",
     ]
+    if args.dataset_name == "random":
+        cmd.extend([
+            "--random-input-len",
+            str(config["isl"]),
+            "--random-range-ratio",
+            str(args.random_range_ratio),
+            "--num-prompts",
+            str(num_prompts),
+            "--ignore-eos",
+        ])
+    else:
+        cmd.extend(["--dataset-path", args.dataset_path])
     if args.endpoint:
         cmd.extend(["--endpoint", args.endpoint])
     if args.trust_remote_code:
@@ -384,18 +406,23 @@ def benchmark_one(
         cmd.extend(["--tokenizer", args.tokenizer])
     if args.tokenizer_mode:
         cmd.extend(["--tokenizer-mode", args.tokenizer_mode])
-    if use_chat_template:
+    if args.dataset_name == "random" and use_chat_template:
         cmd.append("--use-chat-template")
-    if use_dsv4:
+    if args.dataset_name == "random" and use_dsv4:
         cmd.append("--dsv4")
-    if args.random_num_workers is not None:
+    if args.dataset_name == "random" and args.random_num_workers is not None:
         cmd.extend(["--random-num-workers", str(args.random_num_workers)])
     if args.save_detailed:
         cmd.append("--save-detailed")
 
+    benchmark_description = (
+        f"prompts={num_prompts}"
+        if args.dataset_name == "random"
+        else f"dataset={args.dataset_path}"
+    )
     print(
         f"\n[benchmark] {config['exp-name']} conc={conc} "
-        f"isl={config['isl']} osl={config['osl']} prompts={num_prompts}"
+        f"isl={config['isl']} osl={config['osl']} {benchmark_description}"
     )
     run_command(cmd, dry_run=args.dry_run)
     return result_dir / f"{stem}.json"
@@ -603,6 +630,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--backend", default="openai-chat")
     parser.add_argument("--endpoint", default="/v1/chat/completions")
     parser.add_argument("--request-rate", default="inf")
+    parser.add_argument(
+        "--dataset-name",
+        choices=["random", "dumpjsonl"],
+        default="random",
+    )
+    parser.add_argument(
+        "--dataset-path",
+        help="JSONL payload file required by --dataset-name=dumpjsonl.",
+    )
     parser.add_argument("--random-range-ratio", type=float, default=0.8)
     parser.add_argument("--num-prompts", type=int)
     parser.add_argument("--num-prompts-multiplier", type=int, default=10)
@@ -634,7 +670,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--decode-gpus", type=int, help="Override decode GPU count for aggregation")
     parser.add_argument("--dry-run", action="store_true")
 
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.dataset_name == "dumpjsonl":
+        if not args.dataset_path:
+            parser.error("--dataset-path is required for --dataset-name=dumpjsonl")
+        if args.backend != "openai-chat":
+            parser.error("--dataset-name=dumpjsonl requires --backend=openai-chat")
+        if not args.endpoint.endswith("chat/completions"):
+            parser.error(
+                "--dataset-name=dumpjsonl requires a chat/completions endpoint"
+            )
+    return args
 
 
 def main() -> None:
