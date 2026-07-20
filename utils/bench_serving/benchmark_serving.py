@@ -936,6 +936,11 @@ def main(args: argparse.Namespace):
     else:
         raise ValueError(f"Unknown dataset: {args.dataset_name}")
 
+    expected_requests = (
+        len(input_requests)
+        if args.dataset_name == "dumpjsonl"
+        else args.num_prompts
+    )
     goodput_config_dict = check_goodput_args(args)
 
     # Avoid GC processing "static" data - reduce pause times.
@@ -1029,12 +1034,12 @@ def main(args: argparse.Namespace):
 
     max_failure_rate = 0.05
     completed = benchmark_result["completed"]
-    failure_rate = 1 - completed / args.num_prompts
+    failure_rate = 1 - completed / expected_requests
     if failure_rate > max_failure_rate:
         raise SystemExit(
             f"FAIL: request failure rate {failure_rate:.1%} exceeds "
             f"{max_failure_rate:.0%} threshold "
-            f"({completed}/{args.num_prompts} completed)"
+            f"({completed}/{expected_requests} completed)"
         )
 
 
