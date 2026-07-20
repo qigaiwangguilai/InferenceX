@@ -339,6 +339,8 @@ def benchmark_one(
     model = args.model_override or config["model"]
     served_model_name = args.served_model_name or config["model"]
     stem = result_stem(config, conc)
+    if args.dataset_name == "dumpjsonl":
+        stem = f"{stem}_dumpjsonl"
     result_dir = Path(args.result_dir).resolve()
     result_dir.mkdir(parents=True, exist_ok=True)
 
