@@ -124,8 +124,9 @@ def _load_tokenizer(tokenizer_id, tokenizer_mode, trust_remote_code):
     transformers). Prefer backend_request_func.get_tokenizer on fallback so
     client tokenization stays aligned with the sglang server (#1381, #1428).
     """
-    if tokenizer_mode == "deepseek_v4":
-        # HF AutoTokenizer may not recognize deepseek_v4; use vLLM's loader.
+    if tokenizer_mode in {"deepseek_v4", "deepseek_v41"}:
+        # HF AutoTokenizer may not recognize DeepSeek's custom modes; use
+        # vLLM's tokenizer registry so client-side lengths match the server.
         try:
             from vllm.tokenizers import get_tokenizer as _vllm_get_tokenizer
         except ImportError:
@@ -559,6 +560,33 @@ def calculate_metrics(
     return metrics, actual_output_lens
 
 
+def log_request_token_counts(
+    input_requests: List[BenchmarkRequest],
+    outputs: List[RequestFuncOutput],
+) -> None:
+    """Print client token estimates alongside token counts returned by the server."""
+    print("Per-request token counts (client estimate vs. server usage):")
+    for index, (request, output) in enumerate(zip(input_requests, outputs), start=1):
+        server_prompt_tokens = output.server_prompt_tokens
+        input_delta = (
+            server_prompt_tokens - request.prompt_len
+            if server_prompt_tokens is not None
+            else None
+        )
+        fields = [
+            f"request={index}",
+            f"status={'success' if output.success else 'failed'}",
+            f"client_prompt_tokens={request.prompt_len}",
+            f"server_prompt_tokens={server_prompt_tokens}",
+            f"input_delta={input_delta}",
+            f"requested_completion_tokens={request.output_len}",
+            f"server_completion_tokens={output.server_output_tokens}",
+        ]
+        if output.error:
+            fields.append(f"error={output.error!r}")
+        print("[tokens] " + " ".join(fields))
+
+
 async def benchmark(
     backend: str,
     api_url: str,
@@ -580,6 +608,7 @@ async def benchmark(
     goodput_config_dict: Dict[str, float],
     max_concurrency: Optional[int],
     lora_modules: Optional[List[str]],
+    log_request_tokens: bool = False,
 ):
     if backend in ASYNC_REQUEST_FUNCS:
         request_func = ASYNC_REQUEST_FUNCS[backend]
@@ -722,6 +751,9 @@ async def benchmark(
 
     if pbar is not None:
         pbar.close()
+
+    if log_request_tokens:
+        log_request_token_counts(input_requests, outputs)
 
     benchmark_duration = time.perf_counter() - benchmark_start_time
     benchmark_end_time_unix = time.time()
@@ -971,6 +1003,10 @@ def main(args: argparse.Namespace):
             goodput_config_dict=goodput_config_dict,
             max_concurrency=args.max_concurrency,
             lora_modules=args.lora_modules,
+            log_request_tokens=(
+                getattr(args, "log_request_tokens", False)
+                and args.dataset_name == "random"
+            ),
         ))
 
     # Save config and results to json
@@ -1179,6 +1215,12 @@ if __name__ == "__main__":
         "By default, only aggregated metrics are saved to reduce file size.",
     )
     parser.add_argument(
+        "--log-request-tokens",
+        action="store_true",
+        help="For random prompts, print the client-side token estimate and "
+        "token counts returned in the server usage for every request.",
+    )
+    parser.add_argument(
         "--metadata",
         metavar="KEY=VALUE",
         nargs="*",
@@ -1342,7 +1384,14 @@ if __name__ == "__main__":
         '--tokenizer-mode',
         type=str,
         default="auto",
-        choices=['auto', 'slow', 'mistral', 'custom', 'deepseek_v4'],
+        choices=[
+            'auto',
+            'slow',
+            'mistral',
+            'custom',
+            'deepseek_v4',
+            'deepseek_v41',
+        ],
         help='The tokenizer mode.\n\n* "auto" will use the '
         'fast tokenizer if available.\n* "slow" will '
         'always use the slow tokenizer. \n* '

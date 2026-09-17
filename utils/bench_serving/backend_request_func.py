@@ -46,6 +46,8 @@ class RequestFuncOutput:
         default_factory=list)  # List of inter-token latencies
     tpot: float = 0.0  # avg next-token latencies
     prompt_len: int = 0
+    server_prompt_tokens: Optional[int] = None
+    server_output_tokens: Optional[int] = None
     error: str = ""
 
 
@@ -308,9 +310,12 @@ async def async_request_openai_completions(
 
                                 most_recent_timestamp = timestamp
                                 generated_text += text or ""
-                            elif usage := data.get("usage"):
-                                output.output_tokens = usage.get(
+                            if usage := data.get("usage"):
+                                output.server_prompt_tokens = usage.get(
+                                    "prompt_tokens")
+                                output.server_output_tokens = usage.get(
                                     "completion_tokens")
+                                output.output_tokens = output.server_output_tokens
                     if first_chunk_received:
                         output.success = True
                     else:
@@ -427,6 +432,8 @@ async def async_request_openai_chat_completions(
 
                     output.generated_text = generated_text
                     output.latency = most_recent_timestamp - st
+                    output.server_prompt_tokens = usage_prompt_tokens
+                    output.server_output_tokens = usage_completion_tokens
                     if request_func_input.require_usage:
                         try:
                             output.prompt_len, output.output_tokens = (

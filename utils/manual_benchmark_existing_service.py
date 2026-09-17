@@ -16,6 +16,22 @@ Examples:
     --seq-lens 8k1k \
     --conc 256
 
+  # Random-value benchmark against an existing DeepSeek-V4.1 Chat Completions
+  # service. The config key supplies the 8k1k shape and topology metadata; the
+  # tokenizer/model overrides select the V4.1 checkpoint on the client and the
+  # model name registered by the service. Chat formatting remains server-side.
+  python3 utils/manual_benchmark_existing_service.py \
+    --config-files configs/nvidia-master.yaml \
+    --config-key dsv4-fp4-b200-vllm \
+    --base-url http://HOST:PORT \
+    --seq-lens 8k1k \
+    --conc 1 2 4 8 16 \
+    --model-override deepseek-ai/DeepSeek-V4.1-Flash \
+    --tokenizer deepseek-ai/DeepSeek-V4.1-Flash \
+    --tokenizer-mode deepseek_v41 \
+    --served-model-name deepseek-ai/DeepSeek-V4.1-Flash \
+    --log-request-tokens
+
   # Same run with bearer auth. Equivalent to exporting OPENAI_API_KEY first.
   python3 utils/manual_benchmark_existing_service.py \
     --config-files configs/nvidia-master.yaml \
@@ -416,6 +432,8 @@ def benchmark_one(
         cmd.extend(["--random-num-workers", str(args.random_num_workers)])
     if args.save_detailed:
         cmd.append("--save-detailed")
+    if args.log_request_tokens:
+        cmd.append("--log-request-tokens")
 
     benchmark_description = (
         f"prompts={num_prompts}"
@@ -627,7 +645,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--tokenizer-mode",
         default="auto",
-        choices=["auto", "slow", "mistral", "custom", "deepseek_v4"],
+        choices=[
+            "auto",
+            "slow",
+            "mistral",
+            "custom",
+            "deepseek_v4",
+            "deepseek_v41",
+        ],
     )
     parser.add_argument("--backend", default="openai-chat")
     parser.add_argument("--endpoint", default="/v1/chat/completions")
@@ -648,6 +673,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-warmups", type=int)
     parser.add_argument("--random-num-workers", type=int)
     parser.add_argument("--save-detailed", action="store_true")
+    parser.add_argument(
+        "--log-request-tokens",
+        action="store_true",
+        help="For random prompts, log client token estimates and server usage "
+        "token counts for every request.",
+    )
     parser.add_argument("--trust-remote-code", action="store_true", default=True)
     parser.add_argument(
         "--no-trust-remote-code",
