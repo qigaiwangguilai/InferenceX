@@ -124,6 +124,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -351,12 +352,14 @@ def benchmark_one(
     config: dict[str, Any],
     conc: int,
     args: argparse.Namespace,
+    run_timestamp: str,
 ) -> Path:
     model = args.model_override or config["model"]
     served_model_name = args.served_model_name or config["model"]
     stem = result_stem(config, conc)
     if args.dataset_name == "dumpjsonl":
         stem = f"{stem}_dumpjsonl"
+    stem = f"{stem}_{run_timestamp}"
     result_dir = Path(args.result_dir).resolve()
     result_dir.mkdir(parents=True, exist_ok=True)
 
@@ -718,6 +721,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    run_timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     if args.api_key:
         os.environ["OPENAI_API_KEY"] = args.api_key
 
@@ -744,7 +748,7 @@ def main() -> None:
         if not conc_values:
             raise ValueError(f"Config has no conc values: {config}")
         for conc in conc_values:
-            raw_path = benchmark_one(config, int(conc), args)
+            raw_path = benchmark_one(config, int(conc), args, run_timestamp)
             agg_path = process_one(config, raw_path, args)
             if agg_path is not None:
                 agg_paths.append(agg_path)
