@@ -111,7 +111,8 @@ Examples:
     --seq-lens 8k1k \
     --conc 256 \
     --dataset-name dumpjsonl \
-    --dataset-path ./requests.jsonl
+    --dataset-path ./requests.jsonl \
+    --ignore-eos
 """
 
 from __future__ import annotations
@@ -415,10 +416,11 @@ def benchmark_one(
             str(args.random_range_ratio),
             "--num-prompts",
             str(num_prompts),
-            "--ignore-eos",
         ])
     else:
         cmd.extend(["--dataset-path", args.dataset_path])
+    if args.dataset_name == "random" or args.ignore_eos:
+        cmd.append("--ignore-eos")
     if args.endpoint:
         cmd.extend(["--endpoint", args.endpoint])
     if args.trust_remote_code:
@@ -668,6 +670,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--dataset-path",
         help="JSONL payload file required by --dataset-name=dumpjsonl.",
+    )
+    parser.add_argument(
+        "--ignore-eos",
+        action="store_true",
+        help="Send ignore_eos=true for dumpjsonl requests. Random requests always ignore EOS.",
     )
     parser.add_argument("--random-range-ratio", type=float, default=0.8)
     parser.add_argument("--num-prompts", type=int)

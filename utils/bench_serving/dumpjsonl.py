@@ -44,11 +44,17 @@ def prepare_dumpjsonl_payload(
     payload: dict[str, Any],
     model_name: str,
     output_len: int,
+    *,
+    ignore_eos: bool = False,
 ) -> dict[str, Any]:
     """Copy and apply mandatory benchmark overrides to a dumped payload."""
     prepared_payload = deepcopy(payload)
     prepared_payload["model"] = model_name
     prepared_payload["max_tokens"] = output_len
+    if "max_completion_tokens" in prepared_payload:
+        prepared_payload["max_completion_tokens"] = output_len
+    if ignore_eos:
+        prepared_payload["ignore_eos"] = True
     prepared_payload.update({
         "stream": True,
         "stream_options": prepared_payload.get(

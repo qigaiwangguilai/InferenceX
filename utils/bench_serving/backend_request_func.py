@@ -355,6 +355,7 @@ async def async_request_openai_chat_completions(
                 request_func_input.model_name
                 if request_func_input.model_name else request_func_input.model,
                 request_func_input.output_len,
+                ignore_eos=request_func_input.ignore_eos,
             )
         else:
             content = request_func_input.prompt
