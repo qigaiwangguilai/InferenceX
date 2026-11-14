@@ -101,9 +101,7 @@ Examples:
     --prefill-gpus 8 \
     --decode-gpus 8
 
-  # Replay captured OpenAI Chat payloads from JSONL. Each valid record is sent
-  # once per concurrency point; model and max_tokens are overridden from the
-  # served model name and the selected config's OSL.
+  # Replay captured OpenAI Chat payloads from JSONL.
   python3 utils/manual_benchmark_existing_service.py \
     --config-files configs/nvidia-master.yaml \
     --config-key dsv4-fp4-gb200-dynamo-vllm \
@@ -112,6 +110,7 @@ Examples:
     --conc 256 \
     --dataset-name dumpjsonl \
     --dataset-path ./requests.jsonl \
+    --num-prompts 1000 \
     --ignore-eos
 """
 
@@ -364,14 +363,12 @@ def benchmark_one(
     result_dir = Path(args.result_dir).resolve()
     result_dir.mkdir(parents=True, exist_ok=True)
 
-    num_prompts = None
-    if args.dataset_name == "random":
-        num_prompts = args.num_prompts
-        if num_prompts is None:
-            num_prompts = max(
-                args.min_num_prompts,
-                conc * args.num_prompts_multiplier,
-            )
+    num_prompts = args.num_prompts
+    if args.dataset_name == "random" and num_prompts is None:
+        num_prompts = max(
+            args.min_num_prompts,
+            conc * args.num_prompts_multiplier,
+        )
 
     use_chat_template, use_dsv4 = infer_chat_template_mode(
         config,
@@ -414,11 +411,11 @@ def benchmark_one(
             str(config["isl"]),
             "--random-range-ratio",
             str(args.random_range_ratio),
-            "--num-prompts",
-            str(num_prompts),
         ])
     else:
         cmd.extend(["--dataset-path", args.dataset_path])
+    if num_prompts is not None:
+        cmd.extend(["--num-prompts", str(num_prompts)])
     if args.dataset_name == "random" or args.ignore_eos:
         cmd.append("--ignore-eos")
     if args.endpoint:
@@ -445,6 +442,8 @@ def benchmark_one(
         if args.dataset_name == "random"
         else f"dataset={args.dataset_path}"
     )
+    if args.dataset_name == "dumpjsonl" and num_prompts is not None:
+        benchmark_description += f" prompts={num_prompts}"
     print(
         f"\n[benchmark] {config['exp-name']} conc={conc} "
         f"isl={config['isl']} osl={config['osl']} {benchmark_description}"
@@ -677,7 +676,12 @@ def parse_args() -> argparse.Namespace:
         help="Send ignore_eos=true for dumpjsonl requests. Random requests always ignore EOS.",
     )
     parser.add_argument("--random-range-ratio", type=float, default=0.8)
-    parser.add_argument("--num-prompts", type=int)
+    parser.add_argument(
+        "--num-prompts",
+        type=int,
+        help="Requests per concurrency point. For dumpjsonl, truncate or repeat "
+        "records in file order; defaults to all valid records.",
+    )
     parser.add_argument("--num-prompts-multiplier", type=int, default=10)
     parser.add_argument("--min-num-prompts", type=int, default=16)
     parser.add_argument("--num-warmups", type=int)
@@ -714,6 +718,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dry-run", action="store_true")
 
     args = parser.parse_args()
+    if args.num_prompts is not None and args.num_prompts <= 0:
+        parser.error("--num-prompts must be a positive integer")
     if args.dataset_name == "dumpjsonl":
         if not args.dataset_path:
             parser.error("--dataset-path is required for --dataset-name=dumpjsonl")

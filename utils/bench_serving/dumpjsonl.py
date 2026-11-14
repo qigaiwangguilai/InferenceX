@@ -4,8 +4,13 @@ from copy import deepcopy
 from typing import Any
 
 
-def load_dumpjsonl_payloads(dataset_path: str) -> list[dict[str, Any]]:
-    """Load valid JSON object payloads from a JSONL file."""
+def load_dumpjsonl_payloads(
+    dataset_path: str,
+    num_prompts: int | None = None,
+) -> list[dict[str, Any]]:
+    """Load valid JSON objects, truncating or cycling to the requested count."""
+    if num_prompts is not None and num_prompts <= 0:
+        raise ValueError("--num-prompts must be a positive integer.")
     payloads = []
     with open(dataset_path, encoding="utf-8") as dataset_file:
         for line_number, line in enumerate(dataset_file, start=1):
@@ -37,6 +42,8 @@ def load_dumpjsonl_payloads(dataset_path: str) -> list[dict[str, Any]]:
         raise ValueError(
             f"No valid JSON object records found in dataset: {dataset_path}"
         )
+    if num_prompts is not None:
+        return [payloads[index % len(payloads)] for index in range(num_prompts)]
     return payloads
 
 

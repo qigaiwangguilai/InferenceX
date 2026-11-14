@@ -23,6 +23,9 @@ On the client side, run:
         --dataset-name dumpjsonl \
         --dataset-path <path to JSONL dataset>
 
+    Add --num-prompts N to send exactly N requests, repeating records in
+    file order when needed. Without it, every valid record is sent once.
+
     when using tgi backend, add
         --endpoint /generate_stream
     to the end of the command above.
@@ -390,6 +393,7 @@ def sample_random_requests(
 def load_dumpjsonl_requests(
     dataset_path: str,
     output_len: int,
+    num_prompts: Optional[int] = None,
 ) -> List[BenchmarkRequest]:
     """Load OpenAI Chat Completions payloads from a JSONL dump."""
     return [
@@ -400,7 +404,7 @@ def load_dumpjsonl_requests(
             payload=payload,
             require_usage=True,
         )
-        for payload in load_dumpjsonl_payloads(dataset_path)
+        for payload in load_dumpjsonl_payloads(dataset_path, num_prompts)
     ]
 
 
@@ -910,6 +914,10 @@ def save_to_pytorch_benchmark_format(args: argparse.Namespace,
 
 
 def main(args: argparse.Namespace):
+    if args.num_prompts is not None and args.num_prompts <= 0:
+        raise ValueError("--num-prompts must be a positive integer.")
+    if args.dataset_name == "random" and args.num_prompts is None:
+        args.num_prompts = 1000
     print(args)
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -964,6 +972,7 @@ def main(args: argparse.Namespace):
         input_requests = load_dumpjsonl_requests(
             args.dataset_path,
             args.random_output_len,
+            args.num_prompts,
         )
     else:
         raise ValueError(f"Unknown dataset: {args.dataset_name}")
@@ -1150,8 +1159,10 @@ if __name__ == "__main__":
     parser.add_argument(
         "--num-prompts",
         type=int,
-        default=1000,
-        help="Number of prompts to process.",
+        default=None,
+        help="Number of prompts to process. Defaults to 1000 for random and "
+        "all valid records for dumpjsonl. With dumpjsonl, truncate or repeat "
+        "records in file order to reach this count.",
     )
     parser.add_argument(
         "--logprobs",
