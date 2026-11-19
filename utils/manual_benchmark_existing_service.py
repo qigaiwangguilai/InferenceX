@@ -112,12 +112,30 @@ Examples:
     --dataset-path ./requests.jsonl \
     --num-prompts 1000 \
     --ignore-eos
+
+  # Replay pretokenized prompts: each JSONL line contains a flat integer
+  # array in "prompt" instead of "messages". Include the model's chat template
+  # in the token IDs before export; no template is applied during replay.
+  python3 utils/manual_benchmark_existing_service.py \
+    --config-files configs/nvidia-master.yaml \
+    --config-key dsv4-fp4-gb200-dynamo-vllm \
+    --base-url http://HOST:PORT \
+    --served-model-name deepseek-v41 \
+    --backend openai \
+    --endpoint /v1/completions \
+    --seq-lens 8k1k \
+    --conc 256 \
+    --dataset-name dumpjsonl \
+    --dataset-path ./token_requests.jsonl \
+    --num-prompts 1000 \
+    --save-detailed
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import subprocess
 import sys
@@ -127,6 +145,8 @@ import urllib.request
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+
+from bench_serving.dumpjsonl import validate_dumpjsonl_endpoint
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -448,7 +468,12 @@ def benchmark_one(
         f"\n[benchmark] {config['exp-name']} conc={conc} "
         f"isl={config['isl']} osl={config['osl']} {benchmark_description}"
     )
-    run_command(cmd, dry_run=args.dry_run)
+    env = os.environ.copy()
+    if args.request_timeout is not None:
+        env["BENCH_CLIENT_TOTAL_TIMEOUT_S"] = str(args.request_timeout)
+    if args.sock_read_timeout is not None:
+        env["BENCH_CLIENT_SOCK_READ_TIMEOUT_S"] = str(args.sock_read_timeout)
+    run_command(cmd, env=env, dry_run=args.dry_run)
     return result_dir / f"{stem}.json"
 
 
@@ -662,6 +687,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--endpoint", default="/v1/chat/completions")
     parser.add_argument("--request-rate", default="inf")
     parser.add_argument(
+        "--request-timeout",
+        type=float,
+        help="Per-request total timeout in seconds, starting after the concurrency "
+        "slot is acquired. Overrides BENCH_CLIENT_TOTAL_TIMEOUT_S (default: 21600).",
+    )
+    parser.add_argument(
+        "--sock-read-timeout",
+        type=float,
+        help="Socket read timeout in seconds. Overrides BENCH_CLIENT_SOCK_READ_TIMEOUT_S "
+        "(default: unset). The total timeout also covers stalled readers after transport errors.",
+    )
+    parser.add_argument(
         "--dataset-name",
         choices=["random", "dumpjsonl"],
         default="random",
@@ -718,17 +755,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dry-run", action="store_true")
 
     args = parser.parse_args()
+    for name in ("request_timeout", "sock_read_timeout"):
+        value = getattr(args, name)
+        if value is not None and (not math.isfinite(value) or value <= 0):
+            parser.error(f"--{name.replace('_', '-')} must be a finite positive number")
     if args.num_prompts is not None and args.num_prompts <= 0:
         parser.error("--num-prompts must be a positive integer")
     if args.dataset_name == "dumpjsonl":
         if not args.dataset_path:
             parser.error("--dataset-path is required for --dataset-name=dumpjsonl")
-        if args.backend != "openai-chat":
-            parser.error("--dataset-name=dumpjsonl requires --backend=openai-chat")
-        if not args.endpoint.endswith("chat/completions"):
-            parser.error(
-                "--dataset-name=dumpjsonl requires a chat/completions endpoint"
-            )
+        try:
+            validate_dumpjsonl_endpoint(args.backend, args.endpoint)
+        except ValueError as exc:
+            parser.error(str(exc))
     return args
 
 

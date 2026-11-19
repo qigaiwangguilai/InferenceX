@@ -26,6 +26,10 @@ On the client side, run:
     Add --num-prompts N to send exactly N requests, repeating records in
     file order when needed. Without it, every valid record is sent once.
 
+    To replay token IDs, put one {"prompt": [token_id, ...], ...} per JSONL
+    line and use --backend openai --endpoint /v1/completions instead.
+    Token IDs must already include the model's required chat formatting.
+
     when using tgi backend, add
         --endpoint /generate_stream
     to the end of the command above.
@@ -69,7 +73,8 @@ except ImportError:
     from argparse import ArgumentParser as FlexibleArgumentParser
 
 from benchmark_utils import convert_to_pytorch_benchmark_format
-from dumpjsonl import load_dumpjsonl_payloads
+from dumpjsonl import (load_dumpjsonl_payloads, validate_completion_payload,
+                      validate_dumpjsonl_endpoint)
 from encoding_dsv4 import encode_messages as dsv4_encode_messages
 
 MILLISECONDS_TO_SECONDS_CONVERSION = 1000
@@ -394,8 +399,20 @@ def load_dumpjsonl_requests(
     dataset_path: str,
     output_len: int,
     num_prompts: Optional[int] = None,
+    backend: str = "openai-chat",
 ) -> List[BenchmarkRequest]:
-    """Load OpenAI Chat Completions payloads from a JSONL dump."""
+    """Load OpenAI payloads, preserving pretokenized completion prompts."""
+    payloads = load_dumpjsonl_payloads(dataset_path, num_prompts)
+    if backend == "openai":
+        validated_payloads: set[int] = set()
+        for index, payload in enumerate(payloads, start=1):
+            if id(payload) in validated_payloads:
+                continue
+            try:
+                validate_completion_payload(payload)
+            except ValueError as exc:
+                raise ValueError(f"Invalid completions JSONL record {index}: {exc}") from exc
+            validated_payloads.add(id(payload))
     return [
         BenchmarkRequest(
             prompt="",
@@ -404,7 +421,7 @@ def load_dumpjsonl_requests(
             payload=payload,
             require_usage=True,
         )
-        for payload in load_dumpjsonl_payloads(dataset_path, num_prompts)
+        for payload in payloads
     ]
 
 
@@ -956,14 +973,7 @@ def main(args: argparse.Namespace):
             num_workers=args.random_num_workers,
         )
     elif args.dataset_name == "dumpjsonl":
-        if backend != "openai-chat":
-            raise ValueError(
-                "The dumpjsonl dataset requires the openai-chat backend."
-            )
-        if not args.endpoint.endswith("chat/completions"):
-            raise ValueError(
-                "The dumpjsonl dataset requires a chat/completions endpoint."
-            )
+        validate_dumpjsonl_endpoint(backend, args.endpoint)
         if not args.dataset_path:
             raise ValueError(
                 "--dataset-path is required when --dataset-name=dumpjsonl."
@@ -973,6 +983,7 @@ def main(args: argparse.Namespace):
             args.dataset_path,
             args.random_output_len,
             args.num_prompts,
+            backend=backend,
         )
     else:
         raise ValueError(f"Unknown dataset: {args.dataset_name}")
