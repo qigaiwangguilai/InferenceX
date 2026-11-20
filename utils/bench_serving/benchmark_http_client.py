@@ -52,12 +52,17 @@ class _BenchmarkResponseHandler(ResponseHandler):
         try:
             super().connection_lost(exc)
         finally:
-            if payload is not None and not payload.is_eof() and payload.exception() is None:
-                payload.set_exception(
-                    aiohttp.ClientPayloadError(
+            if payload is not None and not payload.is_eof():
+                error = payload.exception()
+                if error is None:
+                    error = aiohttp.ClientPayloadError(
                         "Response connection closed before the body completed"
                     )
-                )
+                # feed_data() may have woken readline before the parser failed.
+                # readline can consume that partial line and install a NEW
+                # waiter without checking the exception again. Reapply even
+                # an existing error so this late waiter is also woken.
+                payload.set_exception(error)
 
 
 class BenchmarkTCPConnector(aiohttp.TCPConnector):
